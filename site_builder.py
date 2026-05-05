@@ -1,7 +1,12 @@
 """
 News記事のHTML(GitHub Pages公開用)を生成する。
 
-ハルオミ帰ってこい
+方向性: ゲームサイトっぽいポップなUI
+- クリーム色背景 × 鮮やかなアクセント
+- 手書き感のある丸み
+- カテゴリ別カラーラベル (シール風)
+- 大きめの可愛いタイトル
+- 英語ラベルなし、日本語で統一
 """
 
 import html
@@ -773,7 +778,14 @@ def render_article(item: dict, article: dict) -> str:
     # セクション
     sections_html = []
     for sec in article.get("sections", []):
-        body_html = render_section_body(sec["body"])
+        # bodyから締め文を分離して表示
+        outro_text = sec.get("outro", "").strip()
+        body_text = sec.get("body", "").strip()
+        # outro と body の両方に同じ締め文が入っているので、bodyから取り除く
+        if outro_text and body_text.endswith(outro_text):
+            body_text = body_text[: -len(outro_text)].strip()
+
+        body_html = render_section_body(body_text)
 
         # セクション直下の画像 (大きく表示)
         gallery_html = ""
@@ -791,17 +803,14 @@ def render_article(item: dict, article: dict) -> str:
         if subs:
             cards = []
             for sub in subs:
-                # 画像 (1枚目を使用)
                 if sub.get("images"):
                     img_url = sub["images"][0]
                     img_html = f'<div class="sub-card__img"><img src="{esc(img_url)}" alt="" loading="lazy"></div>'
                 else:
                     img_html = '<div class="sub-card__img sub-card__img--empty"></div>'
 
-                # 説明
-                body_text = sub.get("body", "").strip()
-                # 改行は <br>
-                body_lines = [esc(ln) for ln in body_text.split("\n") if ln.strip()]
+                sub_body_text = sub.get("body", "").strip()
+                body_lines = [esc(ln) for ln in sub_body_text.split("\n") if ln.strip()]
                 body_inner = "<br>".join(body_lines)
 
                 cards.append(f"""
@@ -812,12 +821,20 @@ def render_article(item: dict, article: dict) -> str:
 </div>""")
             subgrid_html = f'<div class="sub-grid">{"".join(cards)}</div>'
 
+        # 締め文 (サブセクションの後ろ)
+        outro_html = ""
+        if outro_text:
+            outro_lines = [esc(ln) for ln in outro_text.split("\n") if ln.strip()]
+            outro_inner = "<br>".join(outro_lines)
+            outro_html = f'<div class="section__outro">{outro_inner}</div>'
+
         sections_html.append(f"""
 <section class="section">
   <h3 class="section__heading">{esc(sec['heading'])}</h3>
   <div class="section__body">{body_html}</div>
   {gallery_html}
   {subgrid_html}
+  {outro_html}
 </section>""")
 
     meta_parts = [f"<span><strong>投稿</strong>{esc(item['date'])}</span>"]
