@@ -1,14 +1,3 @@
-"""
-News記事のHTML(GitHub Pages公開用)を生成する。
-
-方向性: ゲームサイトっぽいポップなUI
-- クリーム色背景 × 鮮やかなアクセント
-- 手書き感のある丸み
-- カテゴリ別カラーラベル (シール風)
-- 大きめの可愛いタイトル
-- 英語ラベルなし、日本語で統一
-"""
-
 import html
 import re
 from pathlib import Path
@@ -28,16 +17,15 @@ CSS = r"""
 
 :root {
     /* 背景・基調 */
-    --bg: #fff7e8;            /* クリーム */
+    --bg: #fff7e8;           
     --bg-soft: #fff1d6;
     --bg-card: #ffffff;
-    --ink: #2a2046;           /* 濃紺寄りの黒 */
+    --ink: #2a2046;        
     --ink-soft: #5b4f7a;
     --ink-faint: #9b91b8;
     --line: #e8d9b8;
     --line-soft: #f1e5c8;
 
-    /* アクセント (電波人間ぽい鮮やかな色) */
     --pop-orange: #ff7e3d;
     --pop-pink:   #ff5a8a;
     --pop-yellow: #ffc73a;
@@ -46,7 +34,6 @@ CSS = r"""
     --pop-blue:   #4cb6ff;
     --pop-purple: #b586ff;
 
-    /* カテゴリ */
     --cat-stream: var(--pop-blue);
     --cat-event:  var(--pop-pink);
     --cat-other:  var(--pop-green);
@@ -188,7 +175,6 @@ img { max-width: 100%; height: auto; display: block; }
 }
 
 
-/* ───────── 一覧ページ ───────── */
 .list-hero {
     max-width: var(--max-w);
     margin: 56px auto 32px;
