@@ -50,6 +50,10 @@ SKIP_TEXTS = {
     "二次創作ガイドライン", "お問い合わせ",
 }
 
+# 1行に複数のナビ語が含まれていたらフッター行とみなす
+NAV_KEYWORDS = ["トップページへ", "利用規約", "プライバシーポリシー",
+                "二次創作ガイドライン", "お問い合わせ", "Report abuse"]
+
 
 # ---------- HTTP ----------
 def fetch_html(url: str) -> str:
@@ -126,6 +130,13 @@ def is_skippable_text(text: str) -> bool:
     if re.fullmatch(r"/[a-z0-9_/-]+", text):
         return True
     if re.search(r"\[JST\]\s*(?:更新|配信|公開)", text):
+        return True
+    # 1行に複数のナビキーワードが含まれていたらフッター行
+    nav_count = sum(1 for kw in NAV_KEYWORDS if kw in text)
+    if nav_count >= 2:
+        return True
+    # 「/path /path /path」のようにパスばかりが並ぶ行
+    if re.fullmatch(r"(\s*/[a-z0-9_-]+\s*)+", text):
         return True
     return False
 
@@ -341,10 +352,11 @@ def send_news(item: dict, article: dict, site_url: str) -> bool:
     if len(lead) > 250:
         lead = lead[:247].rstrip() + "…"
 
-    # サムネ画像 (最初の画像)
+    # サムネ画像 (Discord用は元のGoogle URLを使う、ローカルパスはサイト内のみ有効)
     thumbnail = None
-    if article.get("all_images"):
-        thumbnail = article["all_images"][0]
+    originals = article.get("all_images_original") or article.get("all_images") or []
+    if originals:
+        thumbnail = originals[0]
 
     embed = {
         "color": color,
@@ -367,6 +379,95 @@ def send_news(item: dict, article: dict, site_url: str) -> bool:
         "embeds": [embed],
     }
     return post_webhook(payload)
+
+
+# ---------- 画像ダウンロード ----------
+IMG_DIR = Path("docs/assets/img")
+
+
+def download_images_for_article(article: dict, slug: str) -> dict:
+    """記事内の全画像URLをローカルにダウンロードし、URLを差し替える。
+    既存ファイルがあればスキップ(キャッシュ)。
+    """
+    article_dir = IMG_DIR / slug
+    article_dir.mkdir(parents=True, exist_ok=True)
+
+    # 全画像URLを収集
+    all_urls = list(article.get("lead_images", []))
+    for sec in article.get("sections", []):
+        all_urls.extend(sec.get("images", []))
+
+    # URL → ローカル相対パス のマッピング
+    url_to_local = {}
+    for i, url in enumerate(all_urls, 1):
+        if url in url_to_local:
+            continue
+
+        # URLから拡張子を推定
+        ext = "jpg"
+        local_name = f"{i:02d}.{ext}"
+        local_path = article_dir / local_name
+
+        # 既にDL済みならスキップ
+        if local_path.exists() and local_path.stat().st_size > 0:
+            url_to_local[url] = f"../assets/img/{slug}/{local_name}"
+            continue
+
+        try:
+            res = requests.get(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+                    "Referer": "https://newdenpafree.ap-gs.com/",
+                    "Sec-Fetch-Dest": "image",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+                timeout=30,
+            )
+            res.raise_for_status()
+            content = res.content
+            ctype = res.headers.get("Content-Type", "").lower()
+
+            # Content-Typeから拡張子確定
+            if "png" in ctype:
+                ext = "png"
+            elif "gif" in ctype:
+                ext = "gif"
+            elif "webp" in ctype:
+                ext = "webp"
+            elif "jpeg" in ctype or "jpg" in ctype:
+                ext = "jpg"
+
+            # 拡張子が変わったらリネーム
+            if ext != "jpg":
+                local_name = f"{i:02d}.{ext}"
+                local_path = article_dir / local_name
+
+            local_path.write_bytes(content)
+            url_to_local[url] = f"../assets/img/{slug}/{local_name}"
+            time.sleep(0.2)  # サーバー負荷軽減
+        except requests.RequestException as e:
+            print(f"  画像DL失敗: {url[:60]}... {e}", file=sys.stderr)
+            # 失敗時は元URLを残す
+            url_to_local[url] = url
+
+    # article内のURLを差し替えた新しい dict を返す
+    new_article = dict(article)
+    new_article["lead_images"] = [url_to_local.get(u, u) for u in article.get("lead_images", [])]
+    new_sections = []
+    for sec in article.get("sections", []):
+        new_sec = dict(sec)
+        new_sec["images"] = [url_to_local.get(u, u) for u in sec.get("images", [])]
+        new_sections.append(new_sec)
+    new_article["sections"] = new_sections
+    new_article["all_images"] = [url_to_local.get(u, u) for u in article.get("all_images", [])]
+    # Discord通知用に元のURLも保持(ローカルパスは外部公開できないため)
+    new_article["all_images_original"] = list(article.get("all_images", []))
+
+    return new_article
 
 
 # ---------- 取得 ----------
@@ -401,14 +502,16 @@ def main():
 
     print(f"取得したNews件数: {len(items)}")
 
-    # 全記事のHTMLを取得 (サイト生成用)
+    # 全記事のHTMLを取得 + 画像DL (サイト生成用)
     items_with_articles = []
     for it in items:
         try:
             article_html = fetch_html(it["url"])
             article = parse_article(article_html, fallback_title=it["title"])
+            # 画像をローカルにDL(URLをローカルパスに置換)
+            article = download_images_for_article(article, it["slug"])
             items_with_articles.append((it, article))
-            time.sleep(0.3)  # サイトに負荷かけないよう少し待つ
+            time.sleep(0.3)
         except requests.RequestException as e:
             print(f"記事取得失敗: {it['url']} - {e}", file=sys.stderr)
             items_with_articles.append((it, None))
