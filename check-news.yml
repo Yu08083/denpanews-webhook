@@ -1,0 +1,106 @@
+name: Check Denpa News
+
+on:
+  schedule:
+    # 通常監視: 1時間ごと (UTC)
+    - cron: '5 * * * *'
+    # 集中監視 1: JST 10:57 = UTC 01:57 起動 (GitHub Actionsのcron遅延に備えて早めに起動)
+    # runner.py が 10:59 まで待機して、JST 10:59-11:02 を1分間隔で4回チェック
+    - cron: '57 1 * * *'
+    # 集中監視 2: JST 14:57 = UTC 05:57 起動
+    # runner.py が 14:59 まで待機して、JST 14:59-15:02 を1分間隔で4回チェック
+    - cron: '57 5 * * *'
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'DEBUGモードで実行 (HTMLを保存)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      intensive:
+        description: '集中監視モード(1分間隔×4回)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+# 同時実行を防ぐ (state.json コミットの競合を避ける)
+concurrency:
+  group: denpa-news-bot
+  cancel-in-progress: false
+
+jobs:
+  check-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Determine intensive mode
+        id: mode
+        run: |
+          # cronイベントの起動時刻でモード判定
+          # workflow_dispatch の入力 / 集中監視cronの場合に集中モード
+          if [ "${{ inputs.intensive }}" = "true" ]; then
+            echo "intensive=1" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "57 1 * * *" ] \
+            || [ "${{ github.event.schedule }}" = "57 5 * * *" ]; then
+            echo "intensive=1" >> $GITHUB_OUTPUT
+          else
+            echo "intensive=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run runner
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DEBUG: ${{ inputs.debug == 'true' && '1' || '' }}
+          INTENSIVE: ${{ steps.mode.outputs.intensive }}
+          TZ: Asia/Tokyo
+        run: python runner.py
+
+      - name: Upload debug artifacts
+        if: ${{ inputs.debug == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html
+          path: |
+            debug_news.html
+            debug_top.html
+          if-no-files-found: ignore
+
+      - name: Commit state if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 最新の状態を取得 (競合回避)
+          git pull --rebase origin ${{ github.ref_name }} || true
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git add state.json
+            git commit -m "Update state [skip ci]"
+            # push失敗時にリトライ
+            for i in 1 2 3; do
+              git pull --rebase origin ${{ github.ref_name }} && \
+                git push && break || sleep 5
+            done
+          else
+            echo "No state changes"
+          fi
