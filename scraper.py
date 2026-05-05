@@ -1,3 +1,14 @@
+"""
+New 電波人間のRPG FREE！ 公式サイトのNewsをスクレイピングし、
+- 全記事の HTML サイトを docs/ に生成 (GitHub Pages 公開用)
+- 新着があれば Discord Webhook に通知 (タイトル + リード + サムネ + リンク)
+
+設計方針:
+- 記事内容のレンダリングは GitHub Pages 側に任せる
+- Discord は「新着があったよ」の予告に徹する
+- スクレイピング失敗(画像ズレなど)があってもサイトを開けば確実に読める
+"""
+
 import json
 import os
 import re
@@ -300,7 +311,7 @@ def parse_article(html_text: str, fallback_title: str = ""):
             current_section["subsections"].append(current_sub)
         sections.append(current_section)
 
-    # bodyを文字列化
+    # bodyを文字列化 + 画像振り分け
     cleaned_sections = []
     for s in sections:
         cleaned_subs = []
@@ -308,12 +319,42 @@ def parse_article(html_text: str, fallback_title: str = ""):
             cleaned_subs.append({
                 "heading": sub["heading"],
                 "body": "\n".join(sub["body"]).strip(),
-                "images": sub["images"],
+                "images": list(sub["images"]),
             })
+
+        section_images = list(s["images"])
+
+        # === 画像の自動振り分け ===
+        # Google Sites の構造上、サブセクションの「キャラ画像」が h3 より前に
+        # 並んでいることがある。サブセクションに画像が無く、親セクション直下に
+        # 「集合絵 + キャラ画像数枚」が固まっている場合、各キャラに割り当てる。
+        subs_without_img = [sub for sub in cleaned_subs if not sub["images"]]
+        if cleaned_subs and len(subs_without_img) == len(cleaned_subs):
+            # サブセクションが全て画像なし
+            n_subs = len(cleaned_subs)
+            # 親セクションの画像数が「サブセクション数」または「サブセクション数+1」のとき振り分ける
+            # +1 のときは先頭1枚を集合絵として残す
+            if len(section_images) == n_subs:
+                # 全部キャラ画像 → 先頭から順に各キャラへ
+                for i, sub in enumerate(cleaned_subs):
+                    sub["images"] = [section_images[i]]
+                section_images = []
+            elif len(section_images) == n_subs + 1:
+                # 集合絵1枚 + キャラ画像N枚
+                for i, sub in enumerate(cleaned_subs):
+                    sub["images"] = [section_images[i + 1]]
+                section_images = [section_images[0]]
+            elif len(section_images) > n_subs:
+                # 集合絵が複数 + キャラ画像N枚 (末尾N枚をキャラに割り当て)
+                offset = len(section_images) - n_subs
+                for i, sub in enumerate(cleaned_subs):
+                    sub["images"] = [section_images[offset + i]]
+                section_images = section_images[:offset]
+
         cleaned_sections.append({
             "heading": s["heading"],
             "body": "\n".join(s["body"]).strip(),
-            "images": s["images"],
+            "images": section_images,
             "subsections": cleaned_subs,
         })
 
@@ -471,7 +512,6 @@ def download_images_for_article(article: dict, slug: str) -> dict:
             content = res.content
             ctype = res.headers.get("Content-Type", "").lower()
 
-            # Content-Typeから拡張子確定
             if "png" in ctype:
                 ext = "png"
             elif "gif" in ctype:
@@ -481,20 +521,17 @@ def download_images_for_article(article: dict, slug: str) -> dict:
             elif "jpeg" in ctype or "jpg" in ctype:
                 ext = "jpg"
 
-            # 拡張子が変わったらリネーム
             if ext != "jpg":
                 local_name = f"{i:02d}.{ext}"
                 local_path = article_dir / local_name
 
             local_path.write_bytes(content)
             url_to_local[url] = f"../assets/img/{slug}/{local_name}"
-            time.sleep(0.2)  # サーバー負荷軽減
+            time.sleep(0.2)  
         except requests.RequestException as e:
             print(f"  画像DL失敗: {url[:60]}... {e}", file=sys.stderr)
-            # 失敗時は元URLを残す
             url_to_local[url] = url
 
-    # article内のURLを差し替えた新しい dict を返す
     new_article = dict(article)
     new_article["lead_images"] = [url_to_local.get(u, u) for u in article.get("lead_images", [])]
     new_sections = []
@@ -515,7 +552,6 @@ def download_images_for_article(article: dict, slug: str) -> dict:
     return new_article
 
 
-# ---------- 取得 ----------
 def fetch_news_list():
     html_text = ""
     try:
@@ -535,7 +571,6 @@ def fetch_news_list():
     return items
 
 
-# ---------- メイン ----------
 def main():
     state = load_state()
     sent_keys = set(state.get("sent", []))
@@ -547,13 +582,11 @@ def main():
 
     print(f"取得したNews件数: {len(items)}")
 
-    # 全記事のHTMLを取得 + 画像DL (サイト生成用)
     items_with_articles = []
     for it in items:
         try:
             article_html = fetch_html(it["url"])
             article = parse_article(article_html, fallback_title=it["title"])
-            # 画像をローカルにDL(URLをローカルパスに置換)
             article = download_images_for_article(article, it["slug"])
             items_with_articles.append((it, article))
             time.sleep(0.3)
