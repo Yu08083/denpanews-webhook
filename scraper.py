@@ -361,47 +361,55 @@ def parse_article(html_text: str, fallback_title: str = ""):
                 section_outro_lines = outro_lines
 
         # === 画像の自動振り分け ===
-        # Google Sites の構造で、サブセクションのキャラ画像が h3 より前に飛ぶことがある。
-        # ヒューリスティック:
-        # - サブセクションの一部または全部が画像なしで、親直下に余分な画像がある場合
-        # - 「集合絵を1枚だけ残す」と仮定し、それ以外を画像なしサブセクションへ順番に割り当てる
+        # 公式サイトは「画像N+1枚を上に並べた後、h3でN個のサブセクション」という構造が多い:
+        #   [画像1: 集合絵] [画像2: A] [画像3: B] [画像4: C]
+        #   h3 A → 説明
+        #   h3 B → 説明
+        #   h3 C → 説明
+        # この場合、画像とh3は別ブロックで管理されているため、
+        # h3の直後に画像が来る/来ないは関係なく、画像順 = サブセクション順 で対応する。
+        #
+        # 戦略: 全画像を出現順にプール化し、サブセクションが N個ある場合、
+        #   - 画像数 == N: 各サブに1枚ずつ
+        #   - 画像数 == N+1: 1枚目を集合絵、残りN枚を各サブに1枚ずつ
+        #   - 画像数 > N+1: 後ろからN枚をサブに1枚ずつ、残りを集合絵としてセクション直下
+        #   - 画像数 < N: 後ろから埋める(画像が足りないサブは空)
         if cleaned_subs:
             n_subs = len(cleaned_subs)
-            subs_with_img_count = sum(1 for sub in cleaned_subs if sub["images"])
-            subs_without_img_count = n_subs - subs_with_img_count
+            # 全画像を出現順にプール化
+            all_pool = list(section_images)
+            for sub in cleaned_subs:
+                all_pool.extend(sub["images"])
 
-            # 振り分けが必要なケース (画像なしサブセクションがある & 親に余剰画像がある)
-            if subs_without_img_count > 0 and len(section_images) > 1:
-                # 集合絵 = 1枚目だけ残し、それ以降をプール
-                pool = section_images[1:]
-                kept_section_images = [section_images[0]]
+            # 振り分けを実施するか?
+            # サブセクションの画像が h3 直後に並んでない可能性が高い場合
+            # = 画像が「セクション直下に複数枚 (集合絵 + キャラ画像)」として固まっている場合
+            should_redistribute = (
+                len(section_images) >= 2
+                or (len(section_images) >= 1 and any(not sub["images"] for sub in cleaned_subs))
+            )
 
-                # 画像なしサブセクションに順番に割り当て
-                pool_idx = 0
+            if should_redistribute and len(all_pool) >= n_subs:
+                # サブセクションを全クリアして振り直し
                 for sub in cleaned_subs:
-                    if not sub["images"] and pool_idx < len(pool):
-                        sub["images"] = [pool[pool_idx]]
-                        pool_idx += 1
+                    sub["images"] = []
 
-                # プールに残った画像はセクション直下の追加画像として戻す
-                kept_section_images.extend(pool[pool_idx:])
-                section_images = kept_section_images
-
-            # 元のロジック: 全部のサブセクションに画像が無く、親に N or N+1 枚だけある場合
-            elif subs_without_img_count == n_subs:
-                if len(section_images) == n_subs:
+                if len(all_pool) == n_subs:
+                    # 集合絵なし、各サブに1枚
                     for i, sub in enumerate(cleaned_subs):
-                        sub["images"] = [section_images[i]]
+                        sub["images"] = [all_pool[i]]
                     section_images = []
-                elif len(section_images) == n_subs + 1:
+                elif len(all_pool) == n_subs + 1:
+                    # 1枚目が集合絵、残りN枚を各サブへ
+                    section_images = [all_pool[0]]
                     for i, sub in enumerate(cleaned_subs):
-                        sub["images"] = [section_images[i + 1]]
-                    section_images = [section_images[0]]
-                elif len(section_images) > n_subs:
-                    offset = len(section_images) - n_subs
+                        sub["images"] = [all_pool[i + 1]]
+                else:
+                    # 画像数 > N+1: 後ろからN枚をサブに、残りはセクション直下
+                    offset = len(all_pool) - n_subs
+                    section_images = all_pool[:offset]
                     for i, sub in enumerate(cleaned_subs):
-                        sub["images"] = [section_images[offset + i]]
-                    section_images = section_images[:offset]
+                        sub["images"] = [all_pool[offset + i]]
 
         # 親セクションのbodyに、締め文を追記
         section_body_combined = "\n".join(s["body"])
