@@ -1,14 +1,3 @@
-"""
-New 電波人間のRPG FREE！ 公式サイトのNewsをスクレイピングし、
-- 全記事の HTML サイトを docs/ に生成 (GitHub Pages 公開用)
-- 新着があれば Discord Webhook に通知 (タイトル + リード + サムネ + リンク)
-
-設計方針:
-- 記事内容のレンダリングは GitHub Pages 側に任せる
-- Discord は「新着があったよ」の予告に徹する
-- スクレイピング失敗(画像ズレなど)があってもサイトを開けば確実に読める
-"""
-
 import json
 import os
 import re
@@ -164,12 +153,15 @@ def looks_like_heading(text: str) -> bool:
 
 
 def promote_headings(elements):
+    """素テキストの中で大見出しっぽい行をheading(level=2)に昇格"""
     new = []
-    for kind, val in elements:
+    for item in elements:
+        kind, val = item[0], item[1]
         if kind == "text" and looks_like_heading(val):
-            new.append(("heading", val))
+            # 昇格した見出しは大見出し扱い (level=2)
+            new.append(("heading", val, 2))
         else:
-            new.append((kind, val))
+            new.append(item)
     return new
 
 
@@ -215,7 +207,9 @@ def parse_article(html_text: str, fallback_title: str = ""):
                 continue
             if text == title:
                 continue
-            elements.append(("heading", text))
+            # h2は大見出し、h3/h4は小見出し
+            level = 2 if el.name == "h2" else 3
+            elements.append(("heading", text, level))
         elif el.name in ("p", "li"):
             text = el.get_text(" ", strip=True)
             if is_skippable_text(text):
@@ -227,7 +221,7 @@ def parse_article(html_text: str, fallback_title: str = ""):
             text = re.sub(r"\s{2,}", "\n", text)
             if el.name == "li":
                 text = f"・{text}"
-            elements.append(("text", text))
+            elements.append(("text", text, None))
         elif el.name == "img":
             src = el.get("src", "")
             if "googleusercontent.com/sitesv/" not in src:
@@ -235,56 +229,100 @@ def parse_article(html_text: str, fallback_title: str = ""):
             if src in seen_imgs:
                 continue
             seen_imgs.add(src)
-            elements.append(("image", src))
+            elements.append(("image", src, None))
 
     elements = promote_headings(elements)
 
     # 重複除去
     deduped = []
-    for kind, val in elements:
-        if kind == "text" and deduped and deduped[-1] == ("text", val):
+    for item in elements:
+        if item[0] == "text" and deduped and deduped[-1][0] == "text" and deduped[-1][1] == item[1]:
             continue
-        deduped.append((kind, val))
+        deduped.append(item)
     elements = deduped
 
     # セクション化
+    # セクション化 (大見出し → サブ見出しの階層構造)
     lead_lines = []
     lead_images = []
     sections = []
-    current = None
+    current_section = None  # 大セクション
+    current_sub = None      # サブセクション
 
-    for kind, val in elements:
-        if kind == "heading":
-            if current:
-                sections.append(current)
-            current = {"heading": val, "body": [], "images": []}
-        elif kind == "text":
-            if current is None:
+    def push_to_current(kind, val):
+        """テキストや画像を現在の最深セクションへ追加"""
+        nonlocal current_sub, current_section
+        target = current_sub or current_section
+        if target is None:
+            if kind == "text":
                 lead_lines.append(val)
-            else:
-                current["body"].append(val)
-        elif kind == "image":
-            if current is None:
+            elif kind == "image":
                 lead_images.append(val)
+            return
+        if kind == "text":
+            target["body"].append(val)
+        elif kind == "image":
+            target["images"].append(val)
+
+    for item in elements:
+        kind = item[0]
+        val = item[1]
+        level = item[2] if len(item) > 2 else None
+
+        if kind == "heading":
+            if level == 2 or current_section is None:
+                # 大見出し: 新しい大セクション開始
+                if current_section:
+                    if current_sub:
+                        current_section["subsections"].append(current_sub)
+                        current_sub = None
+                    sections.append(current_section)
+                current_section = {
+                    "heading": val,
+                    "body": [],
+                    "images": [],
+                    "subsections": [],
+                }
             else:
-                current["images"].append(val)
+                # 小見出し: サブセクション開始
+                if current_sub:
+                    current_section["subsections"].append(current_sub)
+                current_sub = {
+                    "heading": val,
+                    "body": [],
+                    "images": [],
+                }
+        else:
+            push_to_current(kind, val)
 
-    if current:
-        sections.append(current)
+    if current_section:
+        if current_sub:
+            current_section["subsections"].append(current_sub)
+        sections.append(current_section)
 
+    # bodyを文字列化
     cleaned_sections = []
     for s in sections:
-        body_text = "\n".join(s["body"]).strip()
+        cleaned_subs = []
+        for sub in s["subsections"]:
+            cleaned_subs.append({
+                "heading": sub["heading"],
+                "body": "\n".join(sub["body"]).strip(),
+                "images": sub["images"],
+            })
         cleaned_sections.append({
             "heading": s["heading"],
-            "body": body_text,
+            "body": "\n".join(s["body"]).strip(),
             "images": s["images"],
+            "subsections": cleaned_subs,
         })
 
     # 全画像 (サムネ用)
     all_images = list(lead_images)
     for s in cleaned_sections:
         all_images.extend(s["images"])
+        for sub in s["subsections"]:
+            all_images.extend(sub["images"])
 
     return {
         "title": title,
@@ -392,10 +430,12 @@ def download_images_for_article(article: dict, slug: str) -> dict:
     article_dir = IMG_DIR / slug
     article_dir.mkdir(parents=True, exist_ok=True)
 
-    # 全画像URLを収集
+    # 全画像URLを収集 (subsections含む)
     all_urls = list(article.get("lead_images", []))
     for sec in article.get("sections", []):
         all_urls.extend(sec.get("images", []))
+        for sub in sec.get("subsections", []):
+            all_urls.extend(sub.get("images", []))
 
     # URL → ローカル相対パス のマッピング
     url_to_local = {}
@@ -461,10 +501,15 @@ def download_images_for_article(article: dict, slug: str) -> dict:
     for sec in article.get("sections", []):
         new_sec = dict(sec)
         new_sec["images"] = [url_to_local.get(u, u) for u in sec.get("images", [])]
+        new_subs = []
+        for sub in sec.get("subsections", []):
+            new_sub = dict(sub)
+            new_sub["images"] = [url_to_local.get(u, u) for u in sub.get("images", [])]
+            new_subs.append(new_sub)
+        new_sec["subsections"] = new_subs
         new_sections.append(new_sec)
     new_article["sections"] = new_sections
     new_article["all_images"] = [url_to_local.get(u, u) for u in article.get("all_images", [])]
-    # Discord通知用に元のURLも保持(ローカルパスは外部公開できないため)
     new_article["all_images_original"] = list(article.get("all_images", []))
 
     return new_article
