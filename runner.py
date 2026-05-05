@@ -1,11 +1,3 @@
-"""
-GitHub Actions から呼ばれるエントリポイント。
-
-- 通常モード: scraper.py を1回だけ実行
-- 集中監視モード: 環境変数 INTENSIVE=1 のとき、JSTの 10:59-11:02 / 14:59-15:02 の
-  該当時刻になるまで待機しつつ、1分間隔で計4回 scraper.py を実行する
-"""
-
 import os
 import subprocess
 import sys
@@ -14,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 
 JST = timezone(timedelta(hours=9))
 
-# 監視ウィンドウ (start, end の各分を含む) JST
 INTENSIVE_WINDOWS = [
     (10, 59, 11, 2),  # 10:59, 11:00, 11:01, 11:02 の4回
     (14, 59, 15, 2),  # 14:59, 15:00, 15:01, 15:02 の4回
@@ -29,9 +20,6 @@ def run_scraper():
 
 
 def expected_minutes_in_window(now: datetime):
-    """現在時刻が監視ウィンドウ内なら、その日のウィンドウの実行予定時刻リストを返す。
-    そうでなければ None。
-    """
     for sh, sm, eh, em in INTENSIVE_WINDOWS:
         start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
         end = now.replace(hour=eh, minute=em, second=59, microsecond=0)
@@ -46,9 +34,6 @@ def expected_minutes_in_window(now: datetime):
 
 
 def upcoming_window(now: datetime, max_wait_minutes: int = 10):
-    """近い将来 (max_wait_minutes 分以内) に始まる監視ウィンドウがあれば、
-    そのスロット一覧を返す。なければ None。
-    """
     for sh, sm, eh, em in INTENSIVE_WINDOWS:
         start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
         end = now.replace(hour=eh, minute=em, second=59, microsecond=0)
@@ -74,7 +59,6 @@ def intensive_mode():
           f"{[s.strftime('%H:%M') for s in slots]}")
 
     for slot in slots:
-        # スロット時刻まで待機 (既に過ぎていればすぐ実行)
         now = datetime.now(JST)
         wait = (slot - now).total_seconds()
         if wait > 0:
