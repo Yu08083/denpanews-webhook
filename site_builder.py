@@ -1,3 +1,9 @@
+"""
+News記事のHTML(GitHub Pages公開用)を生成する。
+
+ハルオミ帰ってこい
+"""
+
 import html
 import re
 from pathlib import Path
