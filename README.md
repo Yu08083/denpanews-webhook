@@ -15,14 +15,12 @@
 ## ファイル構成
 
 ```
-denpanews-webhook/
-├── .github/
-│   └── workflows/
-│       └── check-news.yml    ← GitHub Actionsワークフロー
-├── scraper.py                ← スクレイピング & Discord送信
-├── runner.py                 ← 通常/集中モードの実行制御
-├── requirements.txt          ← 必要なPythonライブラリ
-├── state.json                ← 送信済みURLの記録(自動生成済み)
+denpa-news-bot/
+├── .github/workflows/check-news.yml   # GitHub Actionsワークフロー
+├── scraper.py                          # スクレイピング & Discord送信
+├── runner.py                           # 通常/集中モードの実行制御
+├── requirements.txt
+├── state.json                          # 自動生成 (送信済みURL)
 ├── .gitignore
 └── README.md
 ```

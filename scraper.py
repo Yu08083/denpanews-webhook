@@ -128,50 +128,9 @@ def is_skippable_text(text: str) -> bool:
         return True
     if re.fullmatch(r"/[a-z0-9_/-]+", text):
         return True
-    if re.search(r"\[JST\]\s*(?:更新|配信|公開)", text):
+    if re.search(r"\[JST\]\s*更新", text):
         return True
     return False
-
-
-# 見出しキーワードのパターン
-# - 「イベント××」「××情報」「××追加」など、典型的な大見出し
-HEADING_PATTERNS = [
-    re.compile(r"^イベント[ァ-ヴー一-龠a-zA-Z]+$"),  # イベントステージ, イベントキャッチ
-    re.compile(r".+(情報|お知らせ|キャンペーン|アップデート)$"),
-    re.compile(r"^(機能追加|調整|不具合修正|新機能|変更点|改修|追加要素|主な変更)"),
-    re.compile(r"^【.+】$"),  # 【お知らせ】【更新内容】など
-    re.compile(r"^■.+"),  # ■見出し
-    re.compile(r"^◆.+"),  # ◆見出し
-    re.compile(r"^▼.+"),
-]
-
-
-def looks_like_heading(text: str) -> bool:
-    """テキスト行が見出しっぽいかを判定。
-    - 30文字以下
-    - 句読点や記号で終わっていない
-    - 上記パターンに合致
-    """
-    if not text or len(text) > 30:
-        return False
-    # 文末に句点や疑問符など → 文章なので除外
-    if text[-1] in "。、！？!?…」』）)":
-        return False
-    for pat in HEADING_PATTERNS:
-        if pat.search(text):
-            return True
-    return False
-
-
-def promote_headings(elements):
-    """素テキストの中から見出しっぽい行を heading に昇格。"""
-    new = []
-    for kind, val in elements:
-        if kind == "text" and looks_like_heading(val):
-            new.append(("heading", val))
-        else:
-            new.append((kind, val))
-    return new
 
 
 def parse_article(html: str, fallback_title: str = ""):
@@ -211,9 +170,9 @@ def parse_article(html: str, fallback_title: str = ""):
                 seen_videos.add(vid)
                 videos.append(f"https://www.youtube.com/watch?v={vid}")
 
-    # 更新日 (例: "2026.05.01 [JST] 更新" / "2026.02.27 [JST] 配信")
+    # 更新日
     updated = ""
-    m3 = re.search(r"(\d{4}[./]\d{1,2}[./]\d{1,2})\s*\[JST\]\s*(?:更新|配信|公開)", html)
+    m3 = re.search(r"(\d{4}[./]\d{1,2}[./]\d{1,2})\s*\[JST\]\s*更新", html)
     if m3:
         updated = m3.group(1)
 
@@ -244,12 +203,6 @@ def parse_article(html: str, fallback_title: str = ""):
             # imgしか含まないpタグはテキスト追加しない
             if not text and el.find("img"):
                 continue
-            # Google Sites では1段落内に複数文を「  」(2連続スペース) で区切ることがある
-            # → 2スペースを改行に変換して読みやすくする
-            text = re.sub(r"\s{2,}", "\n", text)
-            # liタグは行頭に「・」を付けて箇条書きとして区別
-            if el.name == "li":
-                text = f"・{text}"
             elements.append(("text", text))
         elif el.name == "img":
             src = el.get("src", "")
@@ -259,12 +212,6 @@ def parse_article(html: str, fallback_title: str = ""):
                 continue
             seen_imgs.add(src)
             elements.append(("image", src))
-
-    # === 見出し検出強化 ===
-    # 配信記事は h2/h3 がしっかり使われているが、イベント記事では
-    # 「イベントステージ」など大見出しが素テキストになっている。
-    # → 「見出しキーワードに合致する短い素テキスト」は常に heading に昇格する。
-    elements = promote_headings(elements)
 
     # 連続した text の重複除去 (Google Sitesがネスト構造で同テキストを2重に出すことがある)
     deduped = []
@@ -452,38 +399,23 @@ def send_embed_with_images(
     """
     images = images or []
 
-    # 画像処理: 必ずDLしてアップロード(Discord埋め込みでURL読み込み失敗を防ぐ)
+    # 画像処理: 透過PNGならローカル合成→ファイルアップ
     files = {}
-    embed_image_urls = []  # attachment://xxx の参照名
+    embed_image_urls = []  # Embedに添付する画像URL or attachment://
     file_index = 0
 
     for img_url in images[:10]:  # Discordは1メッセージ最大10embed = 10画像
         content, ctype = fetch_image(img_url)
         if not content:
             continue
-        # 透過判定: 透過PNGは白背景合成、それ以外はそのまま
         if needs_white_background(content, ctype):
-            content = composite_on_white(content)
+            new_content = composite_on_white(content)
             fname = f"image_{file_index}.png"
-            mime = "image/png"
+            files[f"files[{file_index}]"] = (fname, new_content, "image/png")
+            embed_image_urls.append(f"attachment://{fname}")
+            file_index += 1
         else:
-            # 拡張子推定
-            ext = "jpg"
-            mime = "image/jpeg"
-            ct_lower = (ctype or "").lower()
-            if "png" in ct_lower:
-                ext = "png"
-                mime = "image/png"
-            elif "gif" in ct_lower:
-                ext = "gif"
-                mime = "image/gif"
-            elif "webp" in ct_lower:
-                ext = "webp"
-                mime = "image/webp"
-            fname = f"image_{file_index}.{ext}"
-        files[f"files[{file_index}]"] = (fname, content, mime)
-        embed_image_urls.append(f"attachment://{fname}")
-        file_index += 1
+            embed_image_urls.append(img_url)
 
     # Embed構築
     # メインEmbed: title/description/最初の画像
