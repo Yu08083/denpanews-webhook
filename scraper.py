@@ -2,13 +2,19 @@
 New 電波人間のRPG FREE！ 公式サイトのNewsをスクレイピングし、
 新しいニュースを記事内容ごとDiscord Webhookに送信する。
 
-機能:
-- /news ページから全Newsリンクを抽出 (カテゴリ: 配信情報/イベント情報/その他)
-- 各記事ページを取得し、本文・画像URL・YouTube動画URLを抜き出す
-- Discord Webhookに、サイトを開かなくても内容が読める形で送信
-- 既知のニュースは state.json で管理。初回は通知せず既知化のみ
+レイアウト方針 (レイアウト1):
+- 1ニュース = 複数メッセージ
+  1. ヘッダー: タイトル / カテゴリ / 投稿日 / リード文
+  2. セクション(見出し+本文+画像) ごとに1メッセージ
+  3. フッター: 動画リンク + 公式サイトリンク
+
+画像処理:
+- Google Sites の画像URLは Content-Type を確認
+- PNG透過画像のときだけPillowで白背景合成し、Discordへ multipart アップロード
+- それ以外は画像URLをそのまま Embed.image に指定
 """
 
+import io
 import json
 import os
 import re
@@ -17,7 +23,7 @@ import time
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 NEWS_URL = "https://newdenpafree.ap-gs.com/news"
 TOP_URL = "https://newdenpafree.ap-gs.com/top"
@@ -32,18 +38,24 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# カテゴリ識別 (Newsページのアンカー#hash → カテゴリ名)
-CATEGORY_ANCHORS = {
-    "qmv6nf7xhjqy": "配信情報",
-    "fl4njortdox4": "イベント情報",
-    "axj59m55504p": "その他",
+CATEGORY_COLORS = {
+    "配信情報": 0x2ECC71,
+    "イベント情報": 0xF1C40F,
+    "その他": 0x95A5A6,
+    "不明": 0x00B0F0,
+}
+CATEGORY_EMOJIS = {
+    "配信情報": "🟢",
+    "イベント情報": "🟡",
+    "その他": "⚪",
 }
 
-CATEGORY_COLORS = {
-    "配信情報": 0x2ECC71,   # 緑
-    "イベント情報": 0xF1C40f, # 黄
-    "その他": 0x95A5A6,     # 灰
-    "不明": 0x00B0F0,
+SKIP_TEXTS = {
+    "Search this site", "Embedded Files",
+    "Skip to main content", "Skip to navigation",
+    "Report abuse", "ENGLISH", "トップページへ",
+    "利用規約", "プライバシーポリシー",
+    "二次創作ガイドライン", "お問い合わせ",
 }
 
 
@@ -59,21 +71,16 @@ def fetch_html(url: str) -> str:
     return res.text
 
 
-# ---------- News一覧パース ----------
+# ---------- News一覧 ----------
 def parse_news_list(html: str):
-    """/news ページから記事リンクを抽出。
-    戻り値: [{date, title, url, category}]
-    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # 各h2(カテゴリ見出し)の位置を取得し、カテゴリ範囲を決定する
-    # h2が見つからない場合のフォールバックも持つ
-    category_ranges = []  # [(start_index_in_doc, category_name)]
-    for h2 in soup.find_all(["h2", "h3"]):
-        text = h2.get_text(" ", strip=True)
+    category_ranges = []
+    for h in soup.find_all(["h2", "h3"]):
+        text = h.get_text(" ", strip=True)
         for cat in ("配信情報", "イベント情報", "その他"):
             if cat in text:
-                category_ranges.append((h2.sourceline or 0, cat, h2))
+                category_ranges.append((h.sourceline or 0, cat))
                 break
 
     items = []
@@ -94,12 +101,9 @@ def parse_news_list(html: str):
         seen.add(full_url)
 
         date = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
-
-        # カテゴリ判定: aタグのソース行番号と、各h2のソース行番号を比較
         category = "不明"
         line = a.sourceline or 0
-        # h2行番号より大きいものの中で最大のものに属する
-        candidates = [(ln, cat) for ln, cat, _ in category_ranges if ln <= line]
+        candidates = [(ln, cat) for ln, cat in category_ranges if ln <= line]
         if candidates:
             category = max(candidates, key=lambda x: x[0])[1]
 
@@ -114,113 +118,426 @@ def parse_news_list(html: str):
     return items
 
 
-# ---------- 記事ページパース ----------
-def parse_article(html: str, fallback_title: str = "") -> dict:
-    """記事ページから内容を抽出。
-    戻り値: {title, body_text, images, videos, updated}
+# ---------- 記事ページパース (順序保持) ----------
+def is_skippable_text(text: str) -> bool:
+    if not text:
+        return True
+    if text in SKIP_TEXTS:
+        return True
+    if "©" in text and "Genius Sonority" in text:
+        return True
+    if re.fullmatch(r"/[a-z0-9_/-]+", text):
+        return True
+    if re.search(r"\[JST\]\s*更新", text):
+        return True
+    return False
+
+
+def parse_article(html: str, fallback_title: str = ""):
+    """記事ページから順序保持でセクション化。
+
+    戻り値:
+      {
+        "title": str,
+        "lead": str,                 # 最初の見出しより前の文章 (リード文)
+        "sections": [
+          {"heading": "イベントステージ", "body": "...", "images": [url, url]},
+          ...
+        ],
+        "videos": [url, ...],
+        "updated": "2026.05.01",
+      }
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # タイトル: <title>タグ から「カテゴリ-スラグ_xxx ｜...」を整形
+    # タイトル
     page_title = (soup.title.string or "").strip() if soup.title else ""
-    # 「イベント情報-20260501001_こどもイベント開催 ｜New 電波人間のRPG FREE！ - 公式サイト」
     title = fallback_title or page_title
     m = re.match(r"[^\-]+-\d+_(.+?)\s*[｜|]", page_title)
     if m:
         title = m.group(1).strip()
 
-    # 本文を構造化して抽出
-    # h2/h3/h4 は見出しとしてマークし、Discord Markdownの太字+▼で装飾する
-    skip_words = {
-        "Search this site", "Embedded Files",
-        "Skip to main content", "Skip to navigation",
-        "Report abuse", "ENGLISH", "トップページへ",
-        "利用規約", "プライバシーポリシー", "二次創作ガイドライン", "お問い合わせ",
-    }
-
-    body_lines = []
-    last_was_heading = False
-    for el in soup.find_all(["h2", "h3", "h4", "p", "li"]):
-        text = el.get_text(" ", strip=True)
-        if not text:
-            continue
-        if text in skip_words:
-            continue
-        if "©" in text and "Genius Sonority" in text:
-            continue
-        if re.fullmatch(r"/[a-z0-9_/-]+", text):
-            continue
-        # 「JST] 更新」行は別フィールドで扱うので本文からは除外
-        if re.search(r"\[JST\]\s*更新", text):
-            continue
-        # タイトル(h1)と同じテキストは除外
-        if text == title:
-            continue
-
-        is_heading = el.name in ("h2", "h3", "h4")
-        if is_heading:
-            # 見出しは Discord Markdown の太字+▼ で装飾
-            formatted = f"\n**▼ {text}**"
-            # 直前も見出しなら改行を減らす
-            if last_was_heading and body_lines:
-                body_lines[-1] = formatted.lstrip()
-            else:
-                body_lines.append(formatted)
-            last_was_heading = True
-        else:
-            # 重複除去
-            if body_lines and body_lines[-1].strip() == text:
-                continue
-            body_lines.append(text)
-            last_was_heading = False
-
-    # 改行で連結。見出しの前は空行を入れて区切りを明確に
-    body_text = "\n".join(body_lines).strip()
-    # 連続改行整理
-    body_text = re.sub(r"\n{3,}", "\n\n", body_text)
-
-    # 画像URL (Google Sites のサーブ用URL)
-    images = []
-    seen_imgs = set()
-    for img in soup.find_all("img", src=True):
-        src = img["src"]
-        if "googleusercontent.com/sitesv/" not in src:
-            continue
-        if src in seen_imgs:
-            continue
-        seen_imgs.add(src)
-        images.append(src)
-
-    # YouTube動画 (iframe / リンク)
+    # YouTube
     videos = []
     seen_videos = set()
     yt_re = re.compile(r"youtube\.com/embed/([A-Za-z0-9_-]{6,})")
     for tag in soup.find_all(["iframe", "a"]):
         attr = tag.get("src") or tag.get("href") or ""
-        m = yt_re.search(attr)
-        if m:
-            vid = m.group(1)
+        m2 = yt_re.search(attr)
+        if m2:
+            vid = m2.group(1)
             if vid not in seen_videos:
                 seen_videos.add(vid)
                 videos.append(f"https://www.youtube.com/watch?v={vid}")
 
-    # 更新日 (例: "2026.05.01 [JST] 更新")
+    # 更新日
     updated = ""
-    m = re.search(r"(\d{4}[./]\d{1,2}[./]\d{1,2})\s*\[JST\]\s*更新", html)
-    if m:
-        updated = m.group(1)
+    m3 = re.search(r"(\d{4}[./]\d{1,2}[./]\d{1,2})\s*\[JST\]\s*更新", html)
+    if m3:
+        updated = m3.group(1)
+
+    # 順序保持で要素を集める
+    # main ぽい領域を選ぶのが理想だが、Google Sitesは構造が定まらないので
+    # body 全体を走査して h2/h3/h4/p/li/img を順に取る
+    body_root = soup.body or soup
+
+    elements = []  # [("heading", text)|("text", text)|("image", url)]
+    seen_imgs = set()
+
+    for el in body_root.descendants:
+        if not isinstance(el, Tag):
+            continue
+        if el.name in ("h2", "h3", "h4"):
+            text = el.get_text(" ", strip=True)
+            if is_skippable_text(text):
+                continue
+            if text == title:
+                continue
+            elements.append(("heading", text))
+        elif el.name in ("p", "li"):
+            text = el.get_text(" ", strip=True)
+            if is_skippable_text(text):
+                continue
+            if text == title:
+                continue
+            # imgしか含まないpタグはテキスト追加しない
+            if not text and el.find("img"):
+                continue
+            elements.append(("text", text))
+        elif el.name == "img":
+            src = el.get("src", "")
+            if "googleusercontent.com/sitesv/" not in src:
+                continue
+            if src in seen_imgs:
+                continue
+            seen_imgs.add(src)
+            elements.append(("image", src))
+
+    # 連続した text の重複除去 (Google Sitesがネスト構造で同テキストを2重に出すことがある)
+    deduped = []
+    for kind, val in elements:
+        if kind == "text" and deduped and deduped[-1] == ("text", val):
+            continue
+        deduped.append((kind, val))
+    elements = deduped
+
+    # セクション化
+    lead_lines = []
+    lead_images = []
+    sections = []
+    current = None  # {"heading": str, "body": [str], "images": [url]}
+
+    for kind, val in elements:
+        if kind == "heading":
+            if current:
+                sections.append(current)
+            current = {"heading": val, "body": [], "images": []}
+        elif kind == "text":
+            if current is None:
+                lead_lines.append(val)
+            else:
+                current["body"].append(val)
+        elif kind == "image":
+            if current is None:
+                lead_images.append(val)
+            else:
+                current["images"].append(val)
+
+    if current:
+        sections.append(current)
+
+    # セクションを整形
+    cleaned_sections = []
+    for s in sections:
+        body_text = "\n".join(s["body"]).strip()
+        cleaned_sections.append({
+            "heading": s["heading"],
+            "body": body_text,
+            "images": s["images"],
+        })
 
     return {
         "title": title,
-        "body_text": body_text,
-        "images": images,
+        "lead": "\n".join(lead_lines).strip(),
+        "lead_images": lead_images,
+        "sections": cleaned_sections,
         "videos": videos,
         "updated": updated,
     }
 
 
+# ---------- 画像処理 ----------
+def fetch_image(url: str):
+    """画像をDLしてバイナリ返す。失敗したら None."""
+    try:
+        res = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
+        res.raise_for_status()
+        return res.content, res.headers.get("Content-Type", "")
+    except Exception as e:
+        print(f"  画像取得失敗: {url[:80]}... {e}", file=sys.stderr)
+        return None, None
+
+
+def needs_white_background(content: bytes, content_type: str) -> bool:
+    """PNGかつアルファチャンネルを持っていれば True"""
+    if "png" not in (content_type or "").lower() and not content[:8].startswith(b"\x89PNG"):
+        return False
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(content))
+        # P (パレット) や RGBA, LA など透過を持ちうるモード
+        if img.mode in ("RGBA", "LA"):
+            return True
+        if img.mode == "P":
+            return "transparency" in img.info
+        return False
+    except Exception:
+        return False
+
+
+def composite_on_white(content: bytes) -> bytes:
+    """PNG透過画像を白背景に合成してPNGバイナリで返す"""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(content))
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[3])  # アルファをマスクに
+        out = io.BytesIO()
+        bg.save(out, format="PNG", optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        print(f"  画像合成失敗: {e}", file=sys.stderr)
+        return content
+
+
+# ---------- 状態管理 ----------
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "sent" in data:
+                return data
+        except json.JSONDecodeError:
+            pass
+    return {"sent": []}
+
+
+def save_state(state):
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+# ---------- Discord 送信 ----------
+def post_webhook(payload: dict = None, files: dict = None) -> bool:
+    """通常POST or マルチパートPOST."""
+    if not WEBHOOK_URL:
+        print("DISCORD_WEBHOOK_URL が設定されていません", file=sys.stderr)
+        return False
+    try:
+        if files:
+            # multipart: payload_json + files
+            data = {"payload_json": json.dumps(payload, ensure_ascii=False)}
+            res = requests.post(WEBHOOK_URL, data=data, files=files, timeout=60)
+        else:
+            res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+    except requests.RequestException as e:
+        print(f"Discord送信例外: {e}", file=sys.stderr)
+        return False
+
+    if res.status_code == 429:
+        try:
+            retry = res.json().get("retry_after", 1)
+        except Exception:
+            retry = 1
+        time.sleep(float(retry) + 0.5)
+        if files:
+            data = {"payload_json": json.dumps(payload, ensure_ascii=False)}
+            res = requests.post(WEBHOOK_URL, data=data, files=files, timeout=60)
+        else:
+            res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+
+    if res.status_code >= 300:
+        print(f"Discord送信失敗: {res.status_code} {res.text[:300]}", file=sys.stderr)
+        return False
+    return True
+
+
+def chunk_text(text: str, limit: int = 4000):
+    """4096字制限を考慮して安全に分割."""
+    if not text:
+        return [""]
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    return chunks
+
+
+def send_embed_with_images(
+    *,
+    color: int,
+    title: str = None,
+    description: str = None,
+    images: list = None,
+    author_name: str = None,
+    fields: list = None,
+    footer: str = None,
+    article_url: str = None,
+):
+    """
+    1メッセージ = 1つのEmbed (テキスト) + 最大10個の画像 を送信。
+    画像はPNG透過なら白背景合成してアップロード、それ以外はURLでEmbed指定。
+    """
+    images = images or []
+
+    # 画像処理: 透過PNGならローカル合成→ファイルアップ
+    files = {}
+    embed_image_urls = []  # Embedに添付する画像URL or attachment://
+    file_index = 0
+
+    for img_url in images[:10]:  # Discordは1メッセージ最大10embed = 10画像
+        content, ctype = fetch_image(img_url)
+        if not content:
+            continue
+        if needs_white_background(content, ctype):
+            new_content = composite_on_white(content)
+            fname = f"image_{file_index}.png"
+            files[f"files[{file_index}]"] = (fname, new_content, "image/png")
+            embed_image_urls.append(f"attachment://{fname}")
+            file_index += 1
+        else:
+            embed_image_urls.append(img_url)
+
+    # Embed構築
+    # メインEmbed: title/description/最初の画像
+    embeds = []
+    main_embed = {"color": color}
+    if author_name:
+        main_embed["author"] = {"name": author_name}
+    if title:
+        main_embed["title"] = title
+        if article_url:
+            main_embed["url"] = article_url
+    if description:
+        main_embed["description"] = description
+    if fields:
+        main_embed["fields"] = fields
+    if footer:
+        main_embed["footer"] = {"text": footer}
+    if embed_image_urls:
+        main_embed["image"] = {"url": embed_image_urls[0]}
+    embeds.append(main_embed)
+
+    # 追加画像はサブEmbed (article_urlを共通にすると Discord がギャラリー表示)
+    for img_ref in embed_image_urls[1:]:
+        sub = {"color": color, "image": {"url": img_ref}}
+        if article_url:
+            sub["url"] = article_url
+        embeds.append(sub)
+
+    payload = {
+        "username": "電波人間 News Bot",
+        "embeds": embeds[:10],
+    }
+    return post_webhook(payload, files=files if files else None)
+
+
+def send_news_to_discord(item: dict, article: dict) -> bool:
+    """
+    1ニュースを複数メッセージで送信。
+    1) ヘッダーメッセージ (タイトル / リード文 / リード画像)
+    2) 各セクション (見出し / 本文 / 画像)
+    3) フッターメッセージ (動画 / 詳細リンク)
+    """
+    category = item.get("category", "不明")
+    color = CATEGORY_COLORS.get(category, CATEGORY_COLORS["不明"])
+    cat_emoji = CATEGORY_EMOJIS.get(category, "📢")
+
+    title = article["title"] or item["title"]
+    lead = article.get("lead", "")
+    lead_images = article.get("lead_images", [])
+    sections = article.get("sections", [])
+    videos = article.get("videos", [])
+    updated = article.get("updated") or item["date"]
+
+    # --- 1) ヘッダー ---
+    header_desc_parts = []
+    if lead:
+        header_desc_parts.append(lead)
+    header_desc = "\n\n".join(header_desc_parts)
+    # 4096字制限
+    header_chunks = chunk_text(header_desc, 4000)
+    ok = send_embed_with_images(
+        color=color,
+        author_name=f"{cat_emoji} {category}",
+        title=f"📢 {title}",
+        description=header_chunks[0] if header_chunks else "",
+        images=lead_images,
+        fields=[
+            {"name": "📅 投稿日", "value": item["date"], "inline": True},
+            {"name": "🔄 更新", "value": updated, "inline": True},
+        ],
+        article_url=item["url"],
+    )
+    if not ok:
+        return False
+    # 残りリード文
+    for chunk in header_chunks[1:]:
+        ok = send_embed_with_images(color=color, description=chunk)
+        if not ok:
+            return False
+        time.sleep(0.5)
+
+    # --- 2) 各セクション ---
+    for sec in sections:
+        sec_title = f"▼ {sec['heading']}"
+        body_chunks = chunk_text(sec["body"], 4000) if sec["body"] else [""]
+
+        # 1セクションは: 最初のチャンク+画像 → 残りチャンク
+        ok = send_embed_with_images(
+            color=color,
+            title=sec_title,
+            description=body_chunks[0],
+            images=sec["images"],
+            article_url=item["url"],
+        )
+        if not ok:
+            return False
+        time.sleep(0.7)  # レート制限対策
+
+        for chunk in body_chunks[1:]:
+            ok = send_embed_with_images(color=color, description=chunk)
+            if not ok:
+                return False
+            time.sleep(0.5)
+
+    # --- 3) フッター ---
+    footer_lines = []
+    if videos:
+        footer_lines.append("**🎬 動画**")
+        footer_lines.extend(videos)
+    footer_lines.append(f"\n[🔗 公式サイトで詳細を見る]({item['url']})")
+    footer_desc = "\n".join(footer_lines)
+
+    ok = send_embed_with_images(
+        color=color,
+        description=footer_desc,
+        footer="New 電波人間のRPG FREE！",
+    )
+    return ok
+
+
+# ---------- 取得 ----------
 def fetch_news():
-    """/news から取得。失敗したら /top にフォールバック。"""
     html = ""
     try:
         html = fetch_html(NEWS_URL)
@@ -245,135 +562,6 @@ def fetch_news():
     return items
 
 
-# ---------- 状態管理 ----------
-def load_state():
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "sent" in data:
-                return data
-        except json.JSONDecodeError:
-            pass
-    return {"sent": []}
-
-
-def save_state(state):
-    STATE_FILE.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
-# ---------- Discord 送信 ----------
-def chunk_text(text: str, limit: int = 4000):
-    """Discord embed description は 4096文字制限。安全のため4000でチャンク。"""
-    chunks = []
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-        # 改行で区切る
-        cut = text.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        chunks.append(text[:cut].rstrip())
-        text = text[cut:].lstrip()
-    return chunks
-
-
-def post_webhook(payload: dict) -> bool:
-    if not WEBHOOK_URL:
-        print("DISCORD_WEBHOOK_URL が設定されていません", file=sys.stderr)
-        return False
-    res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-    if res.status_code == 429:
-        # レート制限
-        retry = res.json().get("retry_after", 1)
-        time.sleep(float(retry) + 0.5)
-        res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-    if res.status_code >= 300:
-        print(f"Discord送信失敗: {res.status_code} {res.text}", file=sys.stderr)
-        return False
-    return True
-
-
-def send_news_to_discord(item: dict, article: dict) -> bool:
-    """
-    1ニュースを1リクエストで送信(可能な限り)。
-    レイアウト方針:
-      - メイン Embed: タイトル / 本文(長すぎる場合は要約) / メイン画像1枚 / 詳細リンク
-      - 追加 Embed: サブ画像 (最大2枚まで)
-      - 本文が長い場合は「続きはサイトで」リンクで誘導
-    """
-    category = item.get("category", "不明")
-    color = CATEGORY_COLORS.get(category, CATEGORY_COLORS["不明"])
-    cat_emoji = {
-        "配信情報": "🟢",
-        "イベント情報": "🟡",
-        "その他": "⚪",
-    }.get(category, "📢")
-
-    title = article.get("title") or item["title"]
-    body = article.get("body_text", "").strip()
-    images = article.get("images", [])
-    videos = article.get("videos", [])
-    updated = article.get("updated") or item["date"]
-
-    # 本文を整形: 段落間に空行を入れて見やすくする
-    # parse_articleで見出しに改行が入っているのでそれを活かす
-    body = re.sub(r"\n{3,}", "\n\n", body).strip()
-
-    # 動画リンクを本文末尾に追加
-    if videos:
-        body += "\n\n**🎬 動画**\n" + "\n".join(videos)
-
-    # 詳細リンクを末尾に追加
-    body += f"\n\n[🔗 公式サイトで詳細を見る]({item['url']})"
-
-    # Discord embed description は最大4096文字。安全のため3800で切り詰めて
-    # 「(本文が長いため省略...)」を追加
-    MAX_DESC = 3800
-    if len(body) > MAX_DESC:
-        # 末尾のリンク部分は残す
-        link_suffix = f"\n\n[🔗 公式サイトで全文を見る]({item['url']})"
-        truncated = body[: MAX_DESC - len(link_suffix) - 30]
-        # 不自然な途中切れを避けるため改行で区切る
-        cut = truncated.rfind("\n")
-        if cut > MAX_DESC // 2:
-            truncated = truncated[:cut]
-        body = truncated + "\n\n…(本文が長いため省略)" + link_suffix
-
-    # メインEmbed
-    embeds = [{
-        "author": {"name": f"{cat_emoji} {category}"},
-        "title": f"📢 {title}",
-        "url": item["url"],
-        "description": body,
-        "color": color,
-        "fields": [
-            {"name": "📅 投稿日", "value": item["date"], "inline": True},
-            {"name": "🔄 更新", "value": updated, "inline": True},
-        ],
-        "footer": {"text": "New 電波人間のRPG FREE！"},
-    }]
-    if images:
-        embeds[0]["image"] = {"url": images[0]}
-
-    # サブ画像 (最大2枚追加 = 合計3枚まで表示)
-    # 同じURLを指定すると Discord が画像をギャラリー風にまとめてくれる
-    for img_url in images[1:3]:
-        embeds.append({
-            "url": item["url"],
-            "image": {"url": img_url},
-            "color": color,
-        })
-
-    payload = {
-        "username": "電波人間 News Bot",
-        "embeds": embeds,
-    }
-    return post_webhook(payload)
-
-
 # ---------- メイン ----------
 def main():
     state = load_state()
@@ -390,8 +578,6 @@ def main():
             print(f"  [{it['category']}] {it['date']} {it['title']}")
 
     first_run = len(sent_keys) == 0
-
-    # 新規 = 既知に無いもの
     new_items = [it for it in items if it["url"] not in sent_keys]
 
     if first_run:
@@ -399,7 +585,6 @@ def main():
         for it in new_items:
             sent_keys.add(it["url"])
     else:
-        # 古い→新しい順で送信
         for it in reversed(new_items):
             print(f"新規News: [{it['category']}] {it['date']} {it['title']}")
             try:
@@ -410,7 +595,6 @@ def main():
             article = parse_article(article_html, fallback_title=it["title"])
             if send_news_to_discord(it, article):
                 sent_keys.add(it["url"])
-                # Webhookレート制限対策の小休止
                 time.sleep(1.0)
 
     state["sent"] = sorted(sent_keys)
