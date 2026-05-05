@@ -1,14 +1,3 @@
-"""
-New 電波人間のRPG FREE！ 公式サイトのNewsをスクレイピングし、
-- 全記事の HTML サイトを docs/ に生成 (GitHub Pages 公開用)
-- 新着があれば Discord Webhook に通知 (タイトル + リード + サムネ + リンク)
-
-設計方針:
-- 記事内容のレンダリングは GitHub Pages 側に任せる
-- Discord は「新着があったよ」の予告に徹する
-- スクレイピング失敗(画像ズレなど)があってもサイトを開けば確実に読める
-"""
-
 import json
 import os
 import re
