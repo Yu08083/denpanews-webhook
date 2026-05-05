@@ -17,15 +17,16 @@ CSS = r"""
 
 :root {
     /* 背景・基調 */
-    --bg: #fff7e8;           
+    --bg: #fff7e8;            /* クリーム */
     --bg-soft: #fff1d6;
     --bg-card: #ffffff;
-    --ink: #2a2046;        
+    --ink: #2a2046;           /* 濃紺寄りの黒 */
     --ink-soft: #5b4f7a;
     --ink-faint: #9b91b8;
     --line: #e8d9b8;
     --line-soft: #f1e5c8;
 
+    /* アクセント (電波人間ぽい鮮やかな色) */
     --pop-orange: #ff7e3d;
     --pop-pink:   #ff5a8a;
     --pop-yellow: #ffc73a;
@@ -34,6 +35,7 @@ CSS = r"""
     --pop-blue:   #4cb6ff;
     --pop-purple: #b586ff;
 
+    /* カテゴリ */
     --cat-stream: var(--pop-blue);
     --cat-event:  var(--pop-pink);
     --cat-other:  var(--pop-green);
@@ -175,6 +177,7 @@ img { max-width: 100%; height: auto; display: block; }
 }
 
 
+/* ───────── 一覧ページ ───────── */
 .list-hero {
     max-width: var(--max-w);
     margin: 56px auto 32px;
@@ -457,6 +460,73 @@ img { max-width: 100%; height: auto; display: block; }
     line-height: 1.95em;
 }
 
+/* サブセクション(キャラ)のカードグリッド */
+.sub-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 18px;
+    margin-top: 22px;
+}
+.sub-card {
+    background: var(--bg-soft);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius-sm);
+    padding: 0;
+    overflow: hidden;
+    box-shadow: 0 4px 0 var(--ink-soft);
+    transition: transform 0.15s, box-shadow 0.15s;
+    display: flex;
+    flex-direction: column;
+}
+.sub-card:hover {
+    transform: translate(-2px, -2px);
+    box-shadow: 0 6px 0 var(--ink-soft);
+}
+.sub-card__img {
+    background: #ffffff;
+    border-bottom: 2px solid var(--ink);
+    aspect-ratio: 1 / 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+.sub-card__img img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+.sub-card__img--empty {
+    background: repeating-linear-gradient(45deg, #fff 0, #fff 8px, var(--bg-soft) 8px, var(--bg-soft) 16px);
+}
+.sub-card__name {
+    font-family: var(--font-display);
+    font-size: 17px;
+    color: var(--ink);
+    text-align: center;
+    padding: 12px 12px 6px;
+    letter-spacing: 0.04em;
+    line-height: 1.3;
+}
+.sub-card__body {
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--ink);
+    padding: 0 14px 16px;
+    text-align: center;
+}
+
+/* セクション内テキストのあと締め */
+.section__outro {
+    margin-top: 22px;
+    font-size: 14px;
+    line-height: 1.85;
+    color: var(--ink-soft);
+    border-top: 2px dotted var(--line);
+    padding-top: 18px;
+}
+
+
 /* 画像ギャラリー */
 .gallery {
     display: grid;
@@ -698,6 +768,8 @@ def render_article(item: dict, article: dict) -> str:
     sections_html = []
     for sec in article.get("sections", []):
         body_html = render_section_body(sec["body"])
+
+        # セクション直下の画像 (大きく表示)
         gallery_html = ""
         if sec["images"]:
             gallery_class = "gallery--single" if len(sec["images"]) == 1 else "gallery--multi"
@@ -707,11 +779,39 @@ def render_article(item: dict, article: dict) -> str:
             )
             gallery_html = f'<div class="gallery {gallery_class}">{figs}</div>'
 
+        # サブセクション = キャラ等のカードグリッド
+        subgrid_html = ""
+        subs = sec.get("subsections", [])
+        if subs:
+            cards = []
+            for sub in subs:
+                # 画像 (1枚目を使用)
+                if sub.get("images"):
+                    img_url = sub["images"][0]
+                    img_html = f'<div class="sub-card__img"><img src="{esc(img_url)}" alt="" loading="lazy"></div>'
+                else:
+                    img_html = '<div class="sub-card__img sub-card__img--empty"></div>'
+
+                # 説明
+                body_text = sub.get("body", "").strip()
+                # 改行は <br>
+                body_lines = [esc(ln) for ln in body_text.split("\n") if ln.strip()]
+                body_inner = "<br>".join(body_lines)
+
+                cards.append(f"""
+<div class="sub-card">
+  {img_html}
+  <div class="sub-card__name">{esc(sub['heading'])}</div>
+  <div class="sub-card__body">{body_inner}</div>
+</div>""")
+            subgrid_html = f'<div class="sub-grid">{"".join(cards)}</div>'
+
         sections_html.append(f"""
 <section class="section">
   <h3 class="section__heading">{esc(sec['heading'])}</h3>
   <div class="section__body">{body_html}</div>
   {gallery_html}
+  {subgrid_html}
 </section>""")
 
     meta_parts = [f"<span><strong>投稿</strong>{esc(item['date'])}</span>"]
