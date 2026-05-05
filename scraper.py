@@ -129,8 +129,8 @@ def parse_article(html: str, fallback_title: str = "") -> dict:
     if m:
         title = m.group(1).strip()
 
-    # 本文の主要テキスト: pタグ・liタグ・h3を中心に集める
-    # ナビ系を除く
+    # 本文を構造化して抽出
+    # h2/h3/h4 は見出しとしてマークし、Discord Markdownの太字+▼で装飾する
     skip_words = {
         "Search this site", "Embedded Files",
         "Skip to main content", "Skip to navigation",
@@ -139,27 +139,45 @@ def parse_article(html: str, fallback_title: str = "") -> dict:
     }
 
     body_lines = []
+    last_was_heading = False
     for el in soup.find_all(["h2", "h3", "h4", "p", "li"]):
         text = el.get_text(" ", strip=True)
         if not text:
             continue
         if text in skip_words:
             continue
-        # コピーライト系
         if "©" in text and "Genius Sonority" in text:
             continue
-        # ナビゲーション(/top 等のパス文字列のみ)
         if re.fullmatch(r"/[a-z0-9_/-]+", text):
             continue
-        # 重複除去
-        if body_lines and body_lines[-1] == text:
+        # 「JST] 更新」行は別フィールドで扱うので本文からは除外
+        if re.search(r"\[JST\]\s*更新", text):
             continue
-        body_lines.append(text)
+        # タイトル(h1)と同じテキストは除外
+        if text == title:
+            continue
 
-    # 「JST] 更新」の行までは前置きとして残す
-    body_text = "\n".join(body_lines)
+        is_heading = el.name in ("h2", "h3", "h4")
+        if is_heading:
+            # 見出しは Discord Markdown の太字+▼ で装飾
+            formatted = f"\n**▼ {text}**"
+            # 直前も見出しなら改行を減らす
+            if last_was_heading and body_lines:
+                body_lines[-1] = formatted.lstrip()
+            else:
+                body_lines.append(formatted)
+            last_was_heading = True
+        else:
+            # 重複除去
+            if body_lines and body_lines[-1].strip() == text:
+                continue
+            body_lines.append(text)
+            last_was_heading = False
+
+    # 改行で連結。見出しの前は空行を入れて区切りを明確に
+    body_text = "\n".join(body_lines).strip()
     # 連続改行整理
-    body_text = re.sub(r"\n{3,}", "\n\n", body_text).strip()
+    body_text = re.sub(r"\n{3,}", "\n\n", body_text)
 
     # 画像URL (Google Sites のサーブ用URL)
     images = []
@@ -280,12 +298,19 @@ def post_webhook(payload: dict) -> bool:
 
 def send_news_to_discord(item: dict, article: dict) -> bool:
     """
-    1ニュースを送信。1件のWebhook POSTに最大10個のembed、
-    embedのdescriptionは最大4096文字。
-    画像は1embedにつき1枚のみ。
+    1ニュースを1リクエストで送信(可能な限り)。
+    レイアウト方針:
+      - メイン Embed: タイトル / 本文(長すぎる場合は要約) / メイン画像1枚 / 詳細リンク
+      - 追加 Embed: サブ画像 (最大2枚まで)
+      - 本文が長い場合は「続きはサイトで」リンクで誘導
     """
     category = item.get("category", "不明")
     color = CATEGORY_COLORS.get(category, CATEGORY_COLORS["不明"])
+    cat_emoji = {
+        "配信情報": "🟢",
+        "イベント情報": "🟡",
+        "その他": "⚪",
+    }.get(category, "📢")
 
     title = article.get("title") or item["title"]
     body = article.get("body_text", "").strip()
@@ -293,81 +318,60 @@ def send_news_to_discord(item: dict, article: dict) -> bool:
     videos = article.get("videos", [])
     updated = article.get("updated") or item["date"]
 
-    # 1つ目のembed: 見出し + 本文先頭
-    body_chunks = chunk_text(body, 4000) if body else [""]
+    # 本文を整形: 段落間に空行を入れて見やすくする
+    # parse_articleで見出しに改行が入っているのでそれを活かす
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
 
-    embeds = []
-    first = {
+    # 動画リンクを本文末尾に追加
+    if videos:
+        body += "\n\n**🎬 動画**\n" + "\n".join(videos)
+
+    # 詳細リンクを末尾に追加
+    body += f"\n\n[🔗 公式サイトで詳細を見る]({item['url']})"
+
+    # Discord embed description は最大4096文字。安全のため3800で切り詰めて
+    # 「(本文が長いため省略...)」を追加
+    MAX_DESC = 3800
+    if len(body) > MAX_DESC:
+        # 末尾のリンク部分は残す
+        link_suffix = f"\n\n[🔗 公式サイトで全文を見る]({item['url']})"
+        truncated = body[: MAX_DESC - len(link_suffix) - 30]
+        # 不自然な途中切れを避けるため改行で区切る
+        cut = truncated.rfind("\n")
+        if cut > MAX_DESC // 2:
+            truncated = truncated[:cut]
+        body = truncated + "\n\n…(本文が長いため省略)" + link_suffix
+
+    # メインEmbed
+    embeds = [{
+        "author": {"name": f"{cat_emoji} {category}"},
         "title": f"📢 {title}",
         "url": item["url"],
-        "description": body_chunks[0] if body_chunks else "",
+        "description": body,
         "color": color,
-        "author": {"name": f"電波人間のRPG FREE！ / {category}"},
         "fields": [
-            {"name": "日付", "value": item["date"], "inline": True},
-            {"name": "更新", "value": updated, "inline": True},
+            {"name": "📅 投稿日", "value": item["date"], "inline": True},
+            {"name": "🔄 更新", "value": updated, "inline": True},
         ],
-        "footer": {"text": "newdenpafree.ap-gs.com"},
-    }
+        "footer": {"text": "New 電波人間のRPG FREE！"},
+    }]
     if images:
-        first["image"] = {"url": images[0]}
-    embeds.append(first)
+        embeds[0]["image"] = {"url": images[0]}
 
-    # 残りの本文チャンク
-    for chunk in body_chunks[1:]:
+    # サブ画像 (最大2枚追加 = 合計3枚まで表示)
+    # 同じURLを指定すると Discord が画像をギャラリー風にまとめてくれる
+    for img_url in images[1:3]:
         embeds.append({
-            "description": chunk,
-            "color": color,
-        })
-
-    # 残り画像 (Discordは1POSTで最大10embed)
-    for img_url in images[1:]:
-        if len(embeds) >= 10:
-            break
-        embeds.append({
-            "url": item["url"],  # 同じURLでグループ化
+            "url": item["url"],
             "image": {"url": img_url},
             "color": color,
         })
 
     payload = {
         "username": "電波人間 News Bot",
-        "embeds": embeds[:10],
+        "embeds": embeds,
     }
-    ok = post_webhook(payload)
-
-    # 10embedを超える場合は追加POSTで補足
-    if ok and len(embeds) < (1 + len(body_chunks) - 1 + len(images) - 1):
-        pass  # 既に10で切られている。追加送信が必要なら下で
-
-    # 画像がまだ余っていたら追加POST
-    rest_images = images[1:]  # first embedで使った1枚を除く
-    used_image_slots = max(0, 10 - (1 + max(0, len(body_chunks) - 1)))
-    leftover = rest_images[used_image_slots:]
-    while ok and leftover:
-        batch = leftover[:10]
-        leftover = leftover[10:]
-        extra_embeds = []
-        for img_url in batch:
-            extra_embeds.append({
-                "url": item["url"],
-                "image": {"url": img_url},
-                "color": color,
-            })
-        ok = post_webhook({
-            "username": "電波人間 News Bot",
-            "embeds": extra_embeds,
-        })
-
-    # YouTube動画は別メッセージで送ると埋め込みプレビューが出る
-    if ok and videos:
-        msg = "🎬 関連動画\n" + "\n".join(videos)
-        ok = post_webhook({
-            "username": "電波人間 News Bot",
-            "content": msg,
-        })
-
-    return ok
+    return post_webhook(payload)
 
 
 # ---------- メイン ----------
