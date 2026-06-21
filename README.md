@@ -1,42 +1,40 @@
-# 電波人間 Twitter News
+# 電波人間 News
 
-電波人間 公式X **[@denpaningen](https://x.com/denpaningen)** の新着ツイートを定期チェックし、
-新着があれば **Discord Webhook に通知**する Bot です。GitHub Actions で完全自動運用。
+[New 電波人間のRPG FREE！](https://newdenpafree.ap-gs.com/) 公式サイトのお知らせを定期スクレイピングし、
 
-[denpanews-webhook](https://github.com/Yu08083/denpanews-webhook)(公式サイト版)の Twitter 通知版。
-運用フロー(`state.json` 管理・初回は既知化して無通知・集中監視モード)はそのまま踏襲しています。
+1. **読みやすく再構成した HTML サイトを GitHub Pages の形でアーカイブ*
+3. **新着があれば Discord Webhook に通知**
 
-## 取得方法
+する Bot です。GitHub Actions で完全自動運用。
 
-公式 X API は有料(月100ドル〜)なので使いません。代わりに
-**Yahoo!リアルタイム検索のバックエンド API** を利用します。認証不要・レート制限なし、
-User-Agent の偽装だけで動きます。
+## 公開サイト
 
-```
-GET https://search.yahoo.co.jp/realtime/api/v1/pagination?p=ID:denpaningen&results=40
-```
-
-`ID:ユーザー名` 演算子で特定アカウントの投稿だけを取得しています。
-(参考: <https://qiita.com/maebahesioru/items/4fc4e6baf5b96aa84061>)
+スクレイピング結果は GitHub Pages 上で公開されます:
+`https://<ユーザー名>.github.io/<リポジトリ名>/`
 
 ## 機能
 
-- `ID:denpaningen` で @denpaningen の最新ツイートを取得
-- 新着があれば Discord に 本文 + 画像 + いいね/RT数 + ツイートリンク を送信
-- 投稿者が本人のエントリだけ通す(引用・メンション混入を除外)
-- 集中監視時間帯は1分間隔でチェック (JST 10:59-11:02 は4回 / JST 14:55-15:15 は21回・広め)
+- 公式サイトから全Newsを取得しカテゴリ判定 (配信情報 / イベント情報 / その他)
+- 新着があれば Discord にタイトル+リード+サムネ画像+リンクを送信
+- 集中監視時間帯 (JST 10:59-11:02 / 14:59-15:02) は1分間隔で4回チェック
 - 通常時間帯は毎時14分(JST)に1回チェック
-- 状態は `state.json` で管理(送信済みツイートID、直近500件保持)、GitHub Actions が自動コミット
+- 状態は `state.json` で管理、サイトは `docs/` に出力、どちらも GitHub Actions が自動コミット
 
 ## ファイル構成
 
 ```
-denpa-tweet-webhook/
-├── .github/workflows/check-tweets.yml   # GitHub Actions ワークフロー
-├── scraper.py                            # Yahoo API 取得 & Discord 送信
-├── runner.py                             # 通常/集中モードの実行制御 (公式サイト版と共通)
+denpa-news-bot/
+├── .github/workflows/check-news.yml   # GitHub Actions ワークフロー
+├── scraper.py                          # スクレイピング & Discord 送信 & サイト生成呼び出し
+├── site_builder.py                     # HTML サイト生成
+├── runner.py                           # 通常/集中モードの実行制御
 ├── requirements.txt
-├── state.json                            # 自動生成 (送信済みツイートID)
+├── state.json                          # 自動生成 (送信済みURL)
+├── docs/                               # 自動生成 (GitHub Pages 公開対象)
+│   ├── index.html
+│   ├── news/news_xxx.html
+│   └── assets/style.css
+├── .gitignore
 └── README.md
 ```
 
@@ -53,50 +51,66 @@ denpa-tweet-webhook/
 - Name: `DISCORD_WEBHOOK_URL`
 - Secret: Discord で発行した Webhook URL
 
-### 3. ワークフローを有効化 → 手動実行
+### 3. GitHub Pages を有効化
+
+`Settings` → `Pages`
+
+- **Source**: `Deploy from a branch`
+- **Branch**: `main` / `/docs`
+- 「Save」をクリック
+
+数分後に `https://<ユーザー名>.github.io/<リポジトリ名>/` でアクセス可能になります。
+
+### 4. ワークフローを有効化 → 手動実行
 
 `Actions` タブを開いてワークフローを有効化 → `Run workflow` で動作確認。
 
 初回実行で:
+- 全Newsをスクレイピング
+- HTML サイトを `docs/` に生成
+- `state.json` を初期化(初回は通知なし)
+- 全部まとめてコミット
 
-- 現在取得できる全ツイートを `state.json` に既知化(**初回は通知なし**)
-- 次回以降、新しく出たツイートだけ通知
+サイトが Pages に公開されたら、リポジトリの「About」欄にURLを設定しておくと便利です。
+
+## 実行スケジュール
+
+| トリガー | UTC | JST | 動作 |
+|---|---|---|---|
+| 通常 | 毎時 5分 | 毎時 14分 | 1回チェック |
+| 集中 ① | 01:57 | 10:57 | 10:59 まで待機 → 10:59-11:02 を1分間隔で4回 |
+| 集中 ② | 05:57 | 14:57 | 14:59 まで待機 → 14:59-15:02 を1分間隔で4回 |
 
 ## ローカルで試す
 
-```
+```bash
 pip install -r requirements.txt
 export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+export SITE_BASE_URL="https://yu08083.github.io/denpanews-webhook"
 python scraper.py
 ```
 
-## 環境変数
+`docs/` 以下を `python -m http.server` で配信すれば、生成サイトをローカルプレビューできます。
 
-| 変数                   | 既定値             | 説明                                              |
-| -------------------- | --------------- | ----------------------------------------------- |
-| `DISCORD_WEBHOOK_URL`| (必須)           | 通知先 Discord Webhook                             |
-| `TWITTER_USERNAME`   | `denpaningen`   | 監視対象のXアカウント (@なし)                     |
-| `SEARCH_QUERY`       | `ID:{username}` | Yahoo検索クエリ。下記の取りこぼし対策で上書き可 |
-| `RESULTS`            | `40`            | 1回の取得件数 (最大40)                            |
-| `INTENSIVE`          | `0`             | `1` で集中監視モード                              |
-| `DEBUG`              | -               | `1` で生レスポンスのキー構造を stderr に出力     |
+```bash
+cd docs && python -m http.server 8000
+# → http://localhost:8000/
+```
 
-## 既知の制約・注意点
+## トラブルシューティング
 
-- **Yahoo インデックスのバイアス**: Yahoo!リアルタイム検索は日本語ツイート + エンゲージメント
-  重視のインデックスです。公式 API のような完全性はなく、エンゲージメントの低いツイートは
-  取りこぼし・遅延が起こり得ます。お知らせ系は概ね拾えますが、100%保証ではありません。
-- **`mtype` は付けていません**: 付けると画像なしツイート(テキストのみのお知らせ)が落ちて
-  通知漏れになるためです。
-- **`ID:denpaningen` で0件になる場合**: 演算子やインデックス事情で本人投稿が引けないことが
-  あります。その場合は `SEARCH_QUERY` を `@denpaningen` や `電波人間` 等に変えて試してください
-  (本人以外の投稿は投稿者フィルタで自動除外されます)。
-- **JSON スキーマのフィールド名揺れ**: Yahoo の内部 API はフィールド名が一部非公開です。
-  `scraper.py` は本文・ID・投稿者などを複数候補キーで総当たり取得する防御的パーサにしています。
-  想定外の構造で本文や画像が空になる場合は、`DEBUG=1` で一度実行すると先頭エントリのキー一覧が
-  stderr に出るので、`scraper.py` 冒頭の `*_KEYS` 候補リストに実際のキーを足してください。
+### Pages のサイトに 404
 
-## state.json をリセットしたい
+- Pages が `main` / `/docs` を参照する設定になっているか確認
+- 初回はビルドに数分かかることがあります
+- `docs/` 内に `.nojekyll` ファイルが存在することを確認 (自動生成されます)
 
-`state.json` を `{"sent": []}` に戻して push → 次回実行が再び初回扱いになり、現状の全ツイートを
-既知化(通知なし)します。
+### state.json をリセットしたい
+
+リポジトリから `state.json` を削除して push → 次回実行時に再度初回扱いとなり、現状の全Newsを既知化(通知なし)。
+
+### ワークフローが動かない
+
+`Actions` タブで実行履歴を確認。失敗していればステップごとのログでエラー内容を確認。
+
+## 作りかけ

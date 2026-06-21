@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 JST = timezone(timedelta(hours=9))
 
 INTENSIVE_WINDOWS = [
-    (10, 59, 11, 2),
-    (14, 55, 15, 15),
+    (10, 59, 11, 2),  # 10:59, 11:00, 11:01, 11:02 の4回
+    (14, 59, 15, 2),  # 14:59, 15:00, 15:01, 15:02 の4回
 ]
 
 
